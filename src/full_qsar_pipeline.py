@@ -3,7 +3,7 @@ EGFR QSAR Pipeline — ChEMBL 33 Data
 =====================================
 从ChEMBL下载EGFR抑制剂 → RDKit特征 → 多模型对比 → 交叉验证 → 特征重要性 → 可视化
 
-Author: [你的名字]
+Author: HuangJunbao
 Date: 2026-06
 """
 

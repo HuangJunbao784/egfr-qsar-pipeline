@@ -3,7 +3,7 @@ MD Trajectory Analysis Tool
 ============================
 自动化分析AMBER/GROMACS MD轨迹: RMSD/RMSF/Rg/PCA/FEL/H-bond
 
-Author: [你的名字]
+Author: HuangJunbao
 Date: 2026-06
 """
 
