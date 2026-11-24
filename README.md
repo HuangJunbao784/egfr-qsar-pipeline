@@ -11,7 +11,15 @@ pip install -r requirements.txt
 python src/full_qsar_pipeline.py --data data/egfr_pic50.csv --out results
 ```
 
-脚本会在 `results/` 生成一张四联图与两张表，全程无需联网。
+也可以安装为命令行工具：
+
+```bash
+pip install -e .
+egfr-qsar --data data/egfr_pic50.csv --out results
+egfr-qsar --seeds 42,7,2026 --out results   # 多种子评估，写入 results/seed_sweep.csv
+```
+
+脚本会在 `results/` 生成一张四联图与若干表格，训练与评估本身无需联网。
 
 ## 结果（seed = 42，80 / 20 划分）
 
@@ -19,6 +27,15 @@ python src/full_qsar_pipeline.py --data data/egfr_pic50.csv --out results
 |---|---|---|---|---|
 | Random Forest | 0.90 | **0.45** | 0.49 ± 0.03 | 1.08 |
 | Gradient Boosting | 0.72 | 0.45 | 0.45 ± 0.02 | 1.08 |
+
+### 多种子稳定性（seed = 42 / 7 / 2026）
+
+| 模型 | Test R² (mean ± sd) | CV R² (mean ± sd) | RMSE (mean) |
+|---|---|---|---|
+| Random Forest | 0.476 ± 0.029 | 0.484 ± 0.024 | 1.049 |
+| Gradient Boosting | 0.459 ± 0.019 | 0.454 ± 0.021 | 1.066 |
+
+单次划分的 Test R² 会在 0.45 附近浮动约 ±0.03，CV 的波动更小。逐 seed 明细见 `results/seed_sweep.csv`。
 
 ### 特征重要性：两种口径
 
@@ -40,7 +57,13 @@ python src/full_qsar_pipeline.py --data data/egfr_pic50.csv --out results
 
 ## 数据
 
-`data/egfr_pic50.csv` 共 6,896 条 EGFR 抑制剂记录，两列：`smiles`、`pIC50`（pIC50 = −log10 IC50 [M]）。数据取自 ChEMBL 33；如需重新拉取，可调用 ChEMBL API 按 target（EGFR, CHEMBL203）筛选活性记录后导出为同格式。
+`data/egfr_pic50.csv` 共 6,896 条 EGFR 抑制剂记录，两列：`smiles`、`pIC50`（pIC50 = −log10 IC50 [M]）。数据取自 ChEMBL 33，由 `scripts/fetch_chembl_egfr.py` 从 ChEMBL API 重建：
+
+```bash
+python scripts/fetch_chembl_egfr.py --out data/egfr_pic50.csv
+```
+
+脚本按 target `CHEMBL203`（EGFR）拉取 IC50、只保留单位为 nM 且关系为等号、数值为正的记录，换算成 pIC50 后按 SMILES 取中位数去重。若用 conda 的 Python 遇到 `[ASN1: NOT_ENOUGH_DATA]` 握手错误，换用 python.org 安装的（OpenSSL 1.1.1）解释器即可。
 
 ## 项目结构
 
@@ -48,10 +71,13 @@ python src/full_qsar_pipeline.py --data data/egfr_pic50.csv --out results
 .
 ├── data/egfr_pic50.csv          # 6,896 EGFR inhibitors
 ├── src/full_qsar_pipeline.py    # CLI: descriptors -> models -> CV -> figures
+├── scripts/fetch_chembl_egfr.py # rebuild the dataset from the ChEMBL API
 ├── results/
 │   ├── qsar_full_analysis.png   # 4-panel figure
 │   ├── feature_importance.csv   # permutation + impurity importance
-│   └── predictions.csv          # test-set predictions and residuals
+│   ├── predictions.csv          # test-set predictions and residuals
+│   └── seed_sweep.csv           # per-seed metrics (--seeds)
+├── pyproject.toml               # pip install -e . -> egfr-qsar
 ├── requirements.txt
 └── LICENSE
 ```
@@ -60,9 +86,10 @@ python src/full_qsar_pipeline.py --data data/egfr_pic50.csv --out results
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--data` | `../data/egfr_pic50.csv` | 输入 CSV |
+| `--data` | `../data/egfr_pic50.csv` | 输入 CSV（找不到时会依次回退到 `data/` 与仓库根目录） |
 | `--out` | `../results` | 输出目录 |
-| `--seed` | `42` | 划分与模型随机种子 |
+| `--seed` | `42` | 图表与表格所用的随机种子 |
+| `--seeds` | 无 | 多种子评估，如 `42,7,2026`，结果写入 `seed_sweep.csv` |
 | `--test-size` | `0.2` | 测试集比例 |
 
 ## English

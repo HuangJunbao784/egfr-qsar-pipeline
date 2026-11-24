@@ -3,11 +3,13 @@
 
 ChEMBL 33 EGFR inhibitors -> 12 RDKit 2D descriptors -> Random Forest vs
 Gradient Boosting -> 5-fold cross-validation -> permutation importance ->
-one four-panel figure and two CSV tables.
+one four-panel figure plus CSV tables.
 
-Example
--------
+Examples
+--------
     python full_qsar_pipeline.py --data ../data/egfr_pic50.csv --out ../results
+    python full_qsar_pipeline.py --seeds 42,7,2026 --out ../results
+    egfr-qsar --data data/egfr_pic50.csv --out results      # after pip install -e .
 """
 from __future__ import annotations
 
@@ -46,6 +48,24 @@ DESCRIPTORS = {
     "NOCount": Descriptors.NOCount,
 }
 
+MODEL_FACTORIES = {
+    "RandomForest": lambda seed: RandomForestRegressor(
+        n_estimators=200, random_state=seed, n_jobs=-1
+    ),
+    "GradientBoost": lambda seed: GradientBoostingRegressor(
+        n_estimators=200, max_depth=5, random_state=seed
+    ),
+}
+
+
+def resolve_data(path: Path) -> Path:
+    """Accept an explicit path, the current directory, or the repository layout."""
+    repo_data = Path(__file__).resolve().parent.parent / "data" / "egfr_pic50.csv"
+    for candidate in (path, Path("data/egfr_pic50.csv"), repo_data):
+        if candidate.exists():
+            return candidate
+    raise SystemExit(f"Data file not found: {path} (pass --data explicitly)")
+
 
 def load_dataset(csv_path: Path) -> pd.DataFrame:
     """Read SMILES / pIC50, drop unparsable molecules, cache RDKit mol objects."""
@@ -81,6 +101,49 @@ def fit_and_score(model, X_train, y_train, X_test, y_test) -> dict:
         "rmse": float(np.sqrt(mean_squared_error(y_test, pred))),
         "pred": pred,
     }
+
+
+def cross_validate(model, X, y, seed):
+    scores = cross_val_score(
+        model, X, y, cv=KFold(n_splits=5, shuffle=True, random_state=seed),
+        scoring="r2", n_jobs=-1,
+    )
+    return float(scores.mean()), float(scores.std())
+
+
+def run_seed_sweep(X, y, seeds, test_size: float, out_dir: Path) -> pd.DataFrame:
+    """Repeat the split and the CV over several seeds and report mean +/- std."""
+    print("\n[4] Seed sweep (split + 5-fold CV per seed) ...")
+    rows = []
+    for seed in seeds:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=seed
+        )
+        for name, factory in MODEL_FACTORIES.items():
+            res = fit_and_score(factory(seed), X_train, y_train, X_test, y_test)
+            cv_mean, cv_std = cross_validate(factory(seed), X, y, seed)
+            rows.append({
+                "seed": seed,
+                "model": name,
+                "train_r2": res["train_r2"],
+                "test_r2": res["test_r2"],
+                "cv_r2_mean": cv_mean,
+                "cv_r2_std": cv_std,
+                "rmse": res["rmse"],
+            })
+    per_seed = pd.DataFrame(rows)
+    per_seed.to_csv(out_dir / "seed_sweep.csv", index=False)
+
+    summary = per_seed.groupby("model").agg(
+        test_r2_mean=("test_r2", "mean"),
+        test_r2_std=("test_r2", "std"),
+        cv_r2_mean=("cv_r2_mean", "mean"),
+        cv_r2_std=("cv_r2_std", "mean"),
+        rmse_mean=("rmse", "mean"),
+    ).round(4)
+    print(summary.to_string())
+    print(f"  Saved: {out_dir / 'seed_sweep.csv'}")
+    return summary
 
 
 def build_figure(results, y_test, y_all, importances, names, seed, out_png: Path):
@@ -136,18 +199,22 @@ def main() -> None:
                         help="CSV with 'smiles' and 'pIC50' columns")
     parser.add_argument("--out", default="../results", type=Path,
                         help="output directory for figures and tables")
-    parser.add_argument("--seed", default=42, type=int)
+    parser.add_argument("--seed", default=42, type=int,
+                        help="seed used for the figures and tables")
+    parser.add_argument("--seeds", default=None,
+                        help="comma-separated seeds for a split/CV sweep, e.g. 42,7,2026")
     parser.add_argument("--test-size", default=0.2, type=float)
     args = parser.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
+    data_path = resolve_data(args.data)
 
     print("=" * 60)
     print("EGFR QSAR Pipeline")
     print("=" * 60)
 
     print("\n[1] Loading data ...")
-    df = load_dataset(args.data)
+    df = load_dataset(data_path)
     print(f"  Molecules: {len(df)}")
 
     print("\n[2] Computing descriptors ...")
@@ -160,28 +227,16 @@ def main() -> None:
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=args.test_size, random_state=args.seed
     )
-    models = {
-        "RandomForest": RandomForestRegressor(
-            n_estimators=200, random_state=args.seed, n_jobs=-1
-        ),
-        "GradientBoost": GradientBoostingRegressor(
-            n_estimators=200, max_depth=5, random_state=args.seed
-        ),
-    }
     results = {}
-    for name, model in models.items():
-        results[name] = fit_and_score(model, X_train, y_train, X_test, y_test)
+    for name, factory in MODEL_FACTORIES.items():
+        results[name] = fit_and_score(factory(args.seed), X_train, y_train, X_test, y_test)
         r = results[name]
         print(f"  {name:14s} Train R2={r['train_r2']:.4f}  "
               f"Test R2={r['test_r2']:.4f}  RMSE={r['rmse']:.3f}")
 
-    print("\n[4] 5-fold cross-validation ...")
-    cv = KFold(n_splits=5, shuffle=True, random_state=args.seed)
-    cv_scores = {}
-    for name, model in models.items():
-        scores = cross_val_score(model, X, y, cv=cv, scoring="r2", n_jobs=-1)
-        cv_scores[name] = scores
-        print(f"  {name:14s} CV R2 = {scores.mean():.4f} +/- {scores.std():.4f}")
+    if args.seeds:
+        seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
+        run_seed_sweep(X, y, seeds, args.test_size, args.out)
 
     print("\n[5] Permutation importance (RandomForest, test set) ...")
     rf = results["RandomForest"]["model"]
@@ -217,7 +272,6 @@ def main() -> None:
     print("\n" + "=" * 60)
     print(f"Best model : {best}")
     print(f"Test R2    : {results[best]['test_r2']:.3f}")
-    print(f"5-fold CV  : {cv_scores[best].mean():.3f} +/- {cv_scores[best].std():.3f}")
     print("=" * 60)
 
 
