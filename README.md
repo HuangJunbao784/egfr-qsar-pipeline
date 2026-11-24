@@ -72,6 +72,7 @@ python scripts/fetch_chembl_egfr.py --out data/egfr_pic50.csv
 ├── data/egfr_pic50.csv          # 6,896 EGFR inhibitors
 ├── src/full_qsar_pipeline.py    # CLI: descriptors -> models -> CV -> figures
 ├── scripts/fetch_chembl_egfr.py # rebuild the dataset from the ChEMBL API
+├── tests/                       # unittest suite (11 cases)
 ├── results/
 │   ├── qsar_full_analysis.png   # 4-panel figure
 │   ├── feature_importance.csv   # permutation + impurity importance
@@ -91,6 +92,14 @@ python scripts/fetch_chembl_egfr.py --out data/egfr_pic50.csv
 | `--seed` | `42` | 图表与表格所用的随机种子 |
 | `--seeds` | 无 | 多种子评估，如 `42,7,2026`，结果写入 `seed_sweep.csv` |
 | `--test-size` | `0.2` | 测试集比例 |
+
+## 测试
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+11 个用例覆盖描述符计算、无效 SMILES 过滤、数据路径解析、模型拟合与交叉验证、ChEMBL 单位换算；CI 会在每次 push 时跑一遍。
 
 ## English
 
