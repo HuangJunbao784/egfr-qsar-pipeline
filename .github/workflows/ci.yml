@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile check
+        run: python -m compileall -q src
+      - name: CLI help
+        run: python src/full_qsar_pipeline.py --help
+      - name: End-to-end run
+        run: python src/full_qsar_pipeline.py --data data/egfr_pic50.csv --out results
