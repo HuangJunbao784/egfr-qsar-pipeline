@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "egfr-qsar-pipeline"
-version = "0.2.0"
+version = "0.3.0"
 description = "QSAR pipeline for EGFR kinase inhibitors: RDKit 2D descriptors, Random Forest vs Gradient Boosting, cross-validation and permutation importance"
 readme = "README.md"
 requires-python = ">=3.9"

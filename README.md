@@ -1,81 +1,79 @@
 # EGFR QSAR Pipeline
 
-**ChEMBL 33 · RDKit 2D descriptors · Random Forest / Gradient Boosting · 5-fold cross-validation**
+**ChEMBL 33 · 12 个 2D 描述符 + 2048 位 Morgan 指纹 · 随机划分 / 骨架划分 · Random Forest vs Gradient Boosting · 5 折交叉验证**
 
-从 SMILES 出发，用 12 个二维分子描述符预测 EGFR 激酶抑制剂的 pIC50，比较两种集成模型，并给出交叉验证、置换重要性、残差与特征排序。
+同一个数据集上比较三套特征（描述符、指纹、两者拼接）与两种划分（随机、Murcko 骨架），并把"随机划分会高估泛化"这件事量化出来。
 
 ## 快速开始
 
 ```bash
 pip install -r requirements.txt
-python src/full_qsar_pipeline.py --data data/egfr_pic50.csv --out results
+python src/full_qsar_pipeline.py                              # 默认：12 描述符 + 随机划分
+python src/full_qsar_pipeline.py --features both --split both # 完整对比
 ```
 
-也可以安装为命令行工具：
+或安装为命令行工具：
 
 ```bash
 pip install -e .
-egfr-qsar --data data/egfr_pic50.csv --out results
-egfr-qsar --seeds 42,7,2026 --out results   # 多种子评估，写入 results/seed_sweep.csv
+egfr-qsar --features both --split both --out results
+egfr-qsar --seeds 42,7,2026 --out results   # 多种子扫描，写入 results/seed_sweep.csv
 ```
 
-脚本会在 `results/` 生成一张四联图与若干表格，训练与评估本身无需联网。
+## 结果（Random Forest，seed = 42，80 / 20）
 
-## 结果（seed = 42，80 / 20 划分）
-
-| 模型 | Train R² | Test R² | 5 折 CV R² | RMSE |
-|---|---|---|---|---|
-| Random Forest | 0.90 | **0.45** | 0.49 ± 0.03 | 1.08 |
-| Gradient Boosting | 0.72 | 0.45 | 0.45 ± 0.02 | 1.08 |
-
-### 多种子稳定性（seed = 42 / 7 / 2026）
-
-| 模型 | Test R² (mean ± sd) | CV R² (mean ± sd) | RMSE (mean) |
-|---|---|---|---|
-| Random Forest | 0.476 ± 0.029 | 0.484 ± 0.024 | 1.049 |
-| Gradient Boosting | 0.459 ± 0.019 | 0.454 ± 0.021 | 1.066 |
-
-单次划分的 Test R² 会在 0.45 附近浮动约 ±0.03，CV 的波动更小。逐 seed 明细见 `results/seed_sweep.csv`。
-
-### 特征重要性：两种口径
-
-| 排名 | 置换重要性（测试集） | 不纯度重要性（RF 内置） |
+| 特征集 | 随机划分 Test R² | Murcko 骨架划分 Test R² |
 |---|---|---|
-| 1 | MW 0.263 | TPSA 0.122 |
-| 2 | RotBonds 0.208 | logP 0.121 |
-| 3 | HBA 0.176 | AroRings 0.118 |
-| 4 | TPSA 0.139 | MW 0.112 |
-| 5 | AroRings 0.127 | qed 0.106 |
+| 12 个描述符 | 0.451 | 0.289 |
+| Morgan 指纹（2048） | 0.707 | 0.560 |
+| 描述符 + 指纹 | **0.713** | **0.552** |
 
-两种口径的差异本身是信息：2D 描述符彼此高度相关（MW、HeavyAtoms、RotBonds 都在刻画分子大小与柔性），置换重要性会在相关特征之间分摊权重，因此把更多权重给了 MW 与 RotBonds；而不纯度重要性更平均地铺在 TPSA、logP、AroRings 上。两种口径共同支持的一点是：**极性表面积与芳香环数对活性有实质贡献**。
+Gradient Boosting 在"描述符 + 指纹"上的同一组数字：随机 0.659 / 骨架 0.498。
 
-### 结论
+### 三个结论
 
-- 12 个 2D 描述符可解释约 45% 的 pIC50 方差，属于 QSAR 中"可用于初筛排序"的水平；
-- 训练 R² 0.90 与测试 R² 0.45 的差距说明模型存在过拟合，但 5 折 CV（0.49 ± 0.03）与测试集接近，说明结论不是单次划分的偶然；
-- 要进一步提升，需要引入 3D 构象或蛋白-配体相互作用特征，而不是继续堆叠 2D 描述符。
+1. **指纹是主要杠杆**：同一模型、同一划分，只把 12 个描述符换成 2048 位 Morgan 指纹，随机划分 R² 从 0.451 升到 0.707。二维描述符能表达的信息量就是有限的。
+2. **随机划分会高估泛化**：换成骨架划分（训练集与测试集不共享任何 Murcko 骨架，测的是"对新化学型"的外推），同一个模型掉到 0.552–0.560。随机划分下大量近似类似物同时落在训练与测试集，模型记住了骨架而不是规律。
+3. **描述符单独跨骨架迁移能力弱**：只有描述符时骨架划分 R² 仅 0.289，与随机划分的 0.451 差距最大。拼接指纹后反而略低于纯指纹（0.552 vs 0.560）——冗余的大小类特征在分布偏移下会拖累模型。
+
+### 数据噪声与天花板
+
+6,896 行记录里只有 56 行是重复 SMILES；有 ≥3 次测量的化合物仅 18 个，而这些化合物的 pIC50 **中位极差达 1.95 个 log 单位**（10% 超过 4.8）。这说明数据集混合了不同 assay 类型与实验条件。测量误差本身有 1–2 个 log 时，随机划分 R² 的物理天花板就在 0.5–0.6 附近。
+
+### 多种子（描述符 + 随机划分，seed = 42 / 7 / 2026）
+
+| 模型 | Test R² (mean ± sd) | CV R² (mean ± sd) |
+|---|---|---|
+| Random Forest | 0.474 ± 0.010 | 0.484 ± 0.024 |
+| Gradient Boosting | 0.436 ± 0.014 | 0.454 ± 0.021 |
+
+### 特征重要性
+
+- **含指纹时**用不纯度重要性（2048 维上做置换重要性不现实）：`morgan_1452` 最高，`logP`、`MW`、`qed` 仍在前 10。
+- **仅描述符时**用置换重要性（测试集）：MW、RotBonds、HBA 居前，TPSA 与 AroRings 紧随其后。
 
 ## 数据
 
-`data/egfr_pic50.csv` 共 6,896 条 EGFR 抑制剂记录，两列：`smiles`、`pIC50`（pIC50 = −log10 IC50 [M]）。数据取自 ChEMBL 33，由 `scripts/fetch_chembl_egfr.py` 从 ChEMBL API 重建：
+`data/egfr_pic50.csv` 共 6,896 条 EGFR 抑制剂记录，两列：`smiles`、`pIC50`（pIC50 = −log10 IC50 [M]）。数据取自 ChEMBL 33，可由 `scripts/fetch_chembl_egfr.py` 从 ChEMBL API 重建：
 
 ```bash
 python scripts/fetch_chembl_egfr.py --out data/egfr_pic50.csv
 ```
 
-脚本按 target `CHEMBL203`（EGFR）拉取 IC50、只保留单位为 nM 且关系为等号、数值为正的记录，换算成 pIC50 后按 SMILES 取中位数去重。若用 conda 的 Python 遇到 `[ASN1: NOT_ENOUGH_DATA]` 握手错误，换用 python.org 安装的（OpenSSL 1.1.1）解释器即可。
+脚本按 target `CHEMBL203`（EGFR）拉取 IC50，只保留单位为 nM、关系为等号、数值为正的记录，换算成 pIC50 后按 SMILES 取中位数去重。若用 conda 的 Python 遇到 `[ASN1: NOT_ENOUGH_DATA]` 握手错误，换用 python.org 安装的（OpenSSL 1.1.1）解释器即可。
 
 ## 项目结构
 
 ```
 .
 ├── data/egfr_pic50.csv          # 6,896 EGFR inhibitors
-├── src/full_qsar_pipeline.py    # CLI: descriptors -> models -> CV -> figures
+├── src/full_qsar_pipeline.py    # CLI: features -> splits -> models -> figures
 ├── scripts/fetch_chembl_egfr.py # rebuild the dataset from the ChEMBL API
-├── tests/                       # unittest suite (11 cases)
+├── tests/                       # unittest suite (17 cases)
 ├── results/
 │   ├── qsar_full_analysis.png   # 4-panel figure
-│   ├── feature_importance.csv   # permutation + impurity importance
+│   ├── split_comparison.csv     # every feature x split combination
+│   ├── feature_importance.csv   # permutation (desc) or impurity (fp)
 │   ├── predictions.csv          # test-set predictions and residuals
 │   └── seed_sweep.csv           # per-seed metrics (--seeds)
 ├── pyproject.toml               # pip install -e . -> egfr-qsar
@@ -87,11 +85,15 @@ python scripts/fetch_chembl_egfr.py --out data/egfr_pic50.csv
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--data` | `../data/egfr_pic50.csv` | 输入 CSV（找不到时会依次回退到 `data/` 与仓库根目录） |
+| `--data` | `../data/egfr_pic50.csv` | 输入 CSV（找不到时回退到 `data/` 与仓库根目录） |
 | `--out` | `../results` | 输出目录 |
+| `--features` | `desc` | `desc` / `fp` / `both` |
+| `--split` | `random` | `random` / `scaffold` / `both` |
 | `--seed` | `42` | 图表与表格所用的随机种子 |
-| `--seeds` | 无 | 多种子评估，如 `42,7,2026`，结果写入 `seed_sweep.csv` |
+| `--seeds` | 无 | 多种子扫描（作用于第一种划分），如 `42,7,2026` |
 | `--test-size` | `0.2` | 测试集比例 |
+
+随机划分用 5 折 KFold；骨架划分用 5 折 GroupKFold（按 scaffold 分组），避免同一骨架跨折泄漏。
 
 ## 测试
 
@@ -99,11 +101,17 @@ python scripts/fetch_chembl_egfr.py --out data/egfr_pic50.csv
 python -m unittest discover -s tests -v
 ```
 
-11 个用例覆盖描述符计算、无效 SMILES 过滤、数据路径解析、模型拟合与交叉验证、ChEMBL 单位换算；CI 会在每次 push 时跑一遍。
+17 个用例覆盖描述符与指纹形状、无效 SMILES 过滤、数据路径解析、随机/骨架划分的无重叠与可复现性、模型拟合与交叉验证、ChEMBL 单位换算；CI 在每次 push 时跑一遍。
+
+## 局限
+
+- 数据混合了不同 assay 类型，尚未按 assay 清洗；这是当前 R² 的主要短板，比换模型更能提升骨架划分下的表现。
+- 未使用 3D 构象或蛋白-配体相互作用特征。这类靶点相关特征通常比 2D 指纹更能跨骨架迁移。
+- 骨架划分采用"随机分配 scaffold"（seed 固定），不是按字母序排列的极端划分；两种协议给出的数字可以差很多，报告时应写清协议。
 
 ## English
 
-A QSAR pipeline for EGFR kinase inhibitors: 6,896 ChEMBL 33 compounds, 12 RDKit 2D descriptors, Random Forest vs Gradient Boosting, 5-fold cross-validation, permutation importance and residual analysis. Run `python src/full_qsar_pipeline.py --data data/egfr_pic50.csv --out results`.
+QSAR pipeline for EGFR kinase inhibitors: 6,896 ChEMBL 33 compounds, 12 RDKit 2D descriptors and/or 2048-bit Morgan fingerprints, Random Forest vs Gradient Boosting, evaluated under both a random split and a Murcko-scaffold split with grouped cross-validation. The scaffold split is the honest number: fingerprints reach R² ≈ 0.56 on unseen chemotypes versus ≈ 0.71 on a random split.
 
 ## License
 

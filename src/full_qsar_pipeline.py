@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """EGFR QSAR pipeline.
 
-ChEMBL 33 EGFR inhibitors -> 12 RDKit 2D descriptors -> Random Forest vs
-Gradient Boosting -> 5-fold cross-validation -> permutation importance ->
-one four-panel figure plus CSV tables.
+6,896 ChEMBL EGFR inhibitors -> 2D descriptors and/or Morgan fingerprints ->
+Random Forest vs Gradient Boosting -> random and Murcko-scaffold splits ->
+5-fold CV -> permutation or impurity importance.
 
 Examples
 --------
     python full_qsar_pipeline.py --data ../data/egfr_pic50.csv --out ../results
-    python full_qsar_pipeline.py --seeds 42,7,2026 --out ../results
-    egfr-qsar --data data/egfr_pic50.csv --out results      # after pip install -e .
+    python full_qsar_pipeline.py --features both --split both
+    egfr-qsar --features fp --split scaffold      # after pip install -e .
 """
 from __future__ import annotations
 
 import argparse
 import warnings
+from collections import defaultdict
 from pathlib import Path
 
 import matplotlib
@@ -25,10 +26,11 @@ import numpy as np
 import pandas as pd
 from rdkit import Chem, RDLogger
 from rdkit.Chem import QED, Descriptors, rdMolDescriptors
+from rdkit.Chem.Scaffolds import MurckoScaffold
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import mean_squared_error, r2_score
-from sklearn.model_selection import KFold, cross_val_score, train_test_split
+from sklearn.model_selection import GroupKFold, KFold, cross_val_score
 
 RDLogger.DisableLog("rdApp.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -56,6 +58,9 @@ MODEL_FACTORIES = {
         n_estimators=200, max_depth=5, random_state=seed
     ),
 }
+
+FP_RADIUS = 2
+FP_BITS = 2048
 
 
 def resolve_data(path: Path) -> Path:
@@ -91,6 +96,59 @@ def compute_descriptors(df: pd.DataFrame) -> list[str]:
     return list(DESCRIPTORS)
 
 
+def build_features(df: pd.DataFrame, kind: str):
+    """Return (matrix, feature names) for the requested feature set."""
+    desc_names = compute_descriptors(df)
+    desc = df[desc_names].to_numpy(dtype=float)
+    if kind == "desc":
+        return desc, desc_names
+
+    fingerprints = np.array([
+        list(rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, FP_RADIUS, nBits=FP_BITS))
+        for mol in df["mol"]
+    ], dtype=np.float32)
+    fp_names = [f"morgan_{i:04d}" for i in range(fingerprints.shape[1])]
+    if kind == "fp":
+        return fingerprints, fp_names
+    return np.hstack([desc, fingerprints]), desc_names + fp_names
+
+
+def make_split(df: pd.DataFrame, method: str, test_size: float, seed: int):
+    """Return (train_idx, test_idx, group_labels) for a random or scaffold split.
+
+    The scaffold split keeps every Murcko scaffold entirely on one side, so the
+    test set measures generalisation to unseen chemotypes rather than to close
+    analogues.
+    """
+    n = len(df)
+    indices = np.arange(n)
+    if method == "random":
+        np.random.default_rng(seed).shuffle(indices)
+        cut = int(round((1.0 - test_size) * n))
+        return indices[:cut], indices[cut:], None
+
+    scaffolds = np.array([
+        MurckoScaffold.MurckoScaffoldSmiles(mol=mol) for mol in df["mol"]
+    ])
+    by_scaffold = defaultdict(list)
+    for i, scaffold in enumerate(scaffolds):
+        by_scaffold[scaffold].append(i)
+
+    groups = sorted(by_scaffold)
+    np.random.default_rng(seed).shuffle(groups)
+
+    target = int(round(test_size * n))
+    test_idx: list[int] = []
+    for scaffold in groups:
+        if len(test_idx) >= target:
+            break
+        test_idx.extend(by_scaffold[scaffold])
+
+    test_idx = np.array(sorted(test_idx))
+    train_idx = np.array(sorted(set(range(n)) - set(test_idx)))
+    return train_idx, test_idx, scaffolds
+
+
 def fit_and_score(model, X_train, y_train, X_test, y_test) -> dict:
     model.fit(X_train, y_train)
     pred = model.predict(X_test)
@@ -103,50 +161,39 @@ def fit_and_score(model, X_train, y_train, X_test, y_test) -> dict:
     }
 
 
-def cross_validate(model, X, y, seed):
-    scores = cross_val_score(
-        model, X, y, cv=KFold(n_splits=5, shuffle=True, random_state=seed),
-        scoring="r2", n_jobs=-1,
-    )
+def cross_validate(model, X, y, method: str, groups, seed: int):
+    if method == "random":
+        cv = KFold(n_splits=5, shuffle=True, random_state=seed)
+    else:
+        cv = GroupKFold(n_splits=5)
+    scores = cross_val_score(model, X, y, cv=cv, groups=groups, scoring="r2", n_jobs=-1)
     return float(scores.mean()), float(scores.std())
 
 
-def run_seed_sweep(X, y, seeds, test_size: float, out_dir: Path) -> pd.DataFrame:
-    """Repeat the split and the CV over several seeds and report mean +/- std."""
-    print("\n[4] Seed sweep (split + 5-fold CV per seed) ...")
+def run_seed_sweep(df, X, y, method: str, seeds, test_size: float, out_dir: Path) -> None:
+    print(f"\n[seed sweep] split={method}")
     rows = []
     for seed in seeds:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=seed
-        )
+        train_idx, test_idx, groups = make_split(df, method, test_size, seed)
         for name, factory in MODEL_FACTORIES.items():
-            res = fit_and_score(factory(seed), X_train, y_train, X_test, y_test)
-            cv_mean, cv_std = cross_validate(factory(seed), X, y, seed)
+            res = fit_and_score(factory(seed), X[train_idx], y[train_idx], X[test_idx], y[test_idx])
+            cv_mean, cv_std = cross_validate(factory(seed), X, y, method, groups, seed)
             rows.append({
-                "seed": seed,
-                "model": name,
-                "train_r2": res["train_r2"],
-                "test_r2": res["test_r2"],
-                "cv_r2_mean": cv_mean,
-                "cv_r2_std": cv_std,
-                "rmse": res["rmse"],
+                "seed": seed, "split": method, "model": name,
+                "train_r2": res["train_r2"], "test_r2": res["test_r2"],
+                "cv_r2_mean": cv_mean, "cv_r2_std": cv_std, "rmse": res["rmse"],
             })
     per_seed = pd.DataFrame(rows)
     per_seed.to_csv(out_dir / "seed_sweep.csv", index=False)
-
     summary = per_seed.groupby("model").agg(
-        test_r2_mean=("test_r2", "mean"),
-        test_r2_std=("test_r2", "std"),
-        cv_r2_mean=("cv_r2_mean", "mean"),
-        cv_r2_std=("cv_r2_std", "mean"),
-        rmse_mean=("rmse", "mean"),
+        test_r2_mean=("test_r2", "mean"), test_r2_std=("test_r2", "std"),
+        cv_r2_mean=("cv_r2_mean", "mean"), cv_r2_std=("cv_r2_std", "mean"),
     ).round(4)
     print(summary.to_string())
     print(f"  Saved: {out_dir / 'seed_sweep.csv'}")
-    return summary
 
 
-def build_figure(results, y_test, y_all, importances, names, seed, out_png: Path):
+def build_figure(results, y_test, y_all, importances, names, title, out_png: Path):
     fig, axes = plt.subplots(2, 2, figsize=(14, 12))
     rf = results["RandomForest"]
 
@@ -159,12 +206,12 @@ def build_figure(results, y_test, y_all, importances, names, seed, out_png: Path
     ax.set_title(f"Random Forest: Test R2 = {rf['test_r2']:.3f}")
 
     ax = axes[0, 1]
-    order = np.argsort(importances)
-    ax.barh(np.arange(len(names)), importances[order], color="steelblue")
-    ax.set_yticks(np.arange(len(names)))
-    ax.set_yticklabels([names[i] for i in order])
-    ax.set_xlabel("Permutation importance (drop in R2)")
-    ax.set_title("Feature Importance (RF, test set)")
+    top = np.argsort(importances)[::-1][:15]
+    ax.barh(np.arange(len(top)), importances[top][::-1], color="steelblue")
+    ax.set_yticks(np.arange(len(top)))
+    ax.set_yticklabels([names[i] for i in top[::-1]], fontsize=8)
+    ax.set_xlabel("Importance")
+    ax.set_title("Top-15 features")
 
     ax = axes[1, 0]
     residuals = y_test - rf["pred"]
@@ -185,7 +232,7 @@ def build_figure(results, y_test, y_all, importances, names, seed, out_png: Path
     ax.set_xticks(xs)
     ax.set_xticklabels(labels)
     ax.set_ylabel("R2")
-    ax.set_title(f"Train vs Test (seed = {seed})")
+    ax.set_title(title)
     ax.legend()
 
     fig.tight_layout()
@@ -195,15 +242,16 @@ def build_figure(results, y_test, y_all, importances, names, seed, out_png: Path
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--data", default="../data/egfr_pic50.csv", type=Path,
-                        help="CSV with 'smiles' and 'pIC50' columns")
-    parser.add_argument("--out", default="../results", type=Path,
-                        help="output directory for figures and tables")
-    parser.add_argument("--seed", default=42, type=int,
-                        help="seed used for the figures and tables")
+    parser.add_argument("--data", default="../data/egfr_pic50.csv", type=Path)
+    parser.add_argument("--out", default="../results", type=Path)
+    parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--seeds", default=None,
-                        help="comma-separated seeds for a split/CV sweep, e.g. 42,7,2026")
+                        help="comma-separated seeds for a sweep of the first split, e.g. 42,7,2026")
     parser.add_argument("--test-size", default=0.2, type=float)
+    parser.add_argument("--features", default="desc", choices=["desc", "fp", "both"],
+                        help="desc = 12 2D descriptors, fp = 2048-bit Morgan fingerprints")
+    parser.add_argument("--split", default="random", choices=["random", "scaffold", "both"],
+                        help="random split or Murcko-scaffold split (unseen chemotypes)")
     args = parser.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -217,45 +265,62 @@ def main() -> None:
     df = load_dataset(data_path)
     print(f"  Molecules: {len(df)}")
 
-    print("\n[2] Computing descriptors ...")
-    names = compute_descriptors(df)
-    X = df[names].to_numpy(dtype=float)
+    print(f"\n[2] Building features ({args.features}) ...")
+    X, names = build_features(df, args.features)
     y = df["pIC50"].to_numpy(dtype=float)
     print(f"  Features: {X.shape[1]}  |  pIC50 range: {y.min():.2f} - {y.max():.2f}")
 
-    print("\n[3] Train/test split and model fitting ...")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=args.test_size, random_state=args.seed
-    )
-    results = {}
-    for name, factory in MODEL_FACTORIES.items():
-        results[name] = fit_and_score(factory(args.seed), X_train, y_train, X_test, y_test)
-        r = results[name]
-        print(f"  {name:14s} Train R2={r['train_r2']:.4f}  "
-              f"Test R2={r['test_r2']:.4f}  RMSE={r['rmse']:.3f}")
+    methods = ["random", "scaffold"] if args.split == "both" else [args.split]
+    rows, per_split = [], {}
+    for method in methods:
+        train_idx, test_idx, groups = make_split(df, method, args.test_size, args.seed)
+        print(f"\n[3] Split={method}: train {len(train_idx)} / test {len(test_idx)}")
+        results = {}
+        for name, factory in MODEL_FACTORIES.items():
+            res = fit_and_score(factory(args.seed), X[train_idx], y[train_idx],
+                                X[test_idx], y[test_idx])
+            cv_mean, cv_std = cross_validate(factory(args.seed), X, y, method, groups, args.seed)
+            results[name] = res
+            rows.append({
+                "split": method, "features": args.features, "model": name,
+                "train_r2": res["train_r2"], "test_r2": res["test_r2"],
+                "cv_r2_mean": cv_mean, "cv_r2_std": cv_std, "rmse": res["rmse"],
+            })
+            print(f"  {name:14s} Train={res['train_r2']:.3f}  Test={res['test_r2']:.3f}  "
+                  f"CV={cv_mean:.3f} +/- {cv_std:.3f}")
+        per_split[method] = (results, test_idx)
 
-    if args.seeds:
-        seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
-        run_seed_sweep(X, y, seeds, args.test_size, args.out)
+    comparison = pd.DataFrame(rows)
+    comparison.to_csv(args.out / "split_comparison.csv", index=False)
+    print("\n" + comparison.round(4).to_string(index=False))
+    print(f"\n  Saved: {args.out / 'split_comparison.csv'}")
 
-    print("\n[5] Permutation importance (RandomForest, test set) ...")
-    rf = results["RandomForest"]["model"]
-    perm = permutation_importance(
-        rf, X_test, y_test, n_repeats=10, random_state=args.seed, n_jobs=-1
-    )
-    importance = perm.importances_mean
-    for i, idx in enumerate(np.argsort(importance)[::-1]):
-        print(f"  {i + 1:2d}. {names[idx]:12s} {importance[idx]:+.4f}")
+    primary = methods[0]
+    results, test_idx = per_split[primary]
+    y_test = y[test_idx]
 
-    print("\n[6] Writing figure and tables ...")
+    if args.features == "desc":
+        print("\n[4] Permutation importance (RandomForest, test set) ...")
+        rf = results["RandomForest"]["model"]
+        importance = permutation_importance(
+            rf, X[test_idx], y_test, n_repeats=10, random_state=args.seed, n_jobs=-1
+        ).importances_mean
+        for i, idx in enumerate(np.argsort(importance)[::-1]):
+            print(f"  {i + 1:2d}. {names[idx]:12s} {importance[idx]:+.4f}")
+    else:
+        print("\n[4] Fingerprints present: reporting impurity importance (top 15).")
+        importance = results["RandomForest"]["model"].feature_importances_
+        for i, idx in enumerate(np.argsort(importance)[::-1][:15]):
+            print(f"  {i + 1:2d}. {names[idx]:14s} {importance[idx]:.4f}")
+
+    print("\n[5] Writing figure and tables ...")
     fig_path = args.out / "qsar_full_analysis.png"
-    build_figure(results, y_test, y, importance, names, args.seed, fig_path)
+    build_figure(results, y_test, y, importance, names,
+                 f"{args.features} features, {primary} split", fig_path)
 
     importance_df = pd.DataFrame({
-        "Descriptor": names,
-        "PermutationImportance": importance,
-        "ImpurityImportance": rf.feature_importances_,
-    }).sort_values("PermutationImportance", ascending=False)
+        "Descriptor": names, "Importance": importance,
+    }).sort_values("Importance", ascending=False)
     importance_df.to_csv(args.out / "feature_importance.csv", index=False)
 
     pred_df = pd.DataFrame({
@@ -264,14 +329,15 @@ def main() -> None:
         "Residual": y_test - results["RandomForest"]["pred"],
     })
     pred_df.to_csv(args.out / "predictions.csv", index=False)
-
     for path in (fig_path, args.out / "feature_importance.csv", args.out / "predictions.csv"):
         print(f"  Saved: {path}")
 
-    best = max(results, key=lambda k: results[k]["test_r2"])
+    if args.seeds:
+        seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
+        run_seed_sweep(df, X, y, primary, seeds, args.test_size, args.out)
+
     print("\n" + "=" * 60)
-    print(f"Best model : {best}")
-    print(f"Test R2    : {results[best]['test_r2']:.3f}")
+    print(f"Features: {args.features}  |  split: {args.split}")
     print("=" * 60)
 
 
